@@ -1,13 +1,16 @@
 # Ventas mensuales por sucursal (FUDO)
 
 Servicio web **aparte** para Railway: una página privada con un botón **Generar** que lee las ventas
-de FUDO de cada sucursal y entrega las ventas mensuales de 2025 y 2026 en pantalla y en Excel
-(hojas: ventas con IVA, ventas netas y tickets).
+de FUDO de cada sucursal y entrega, en pantalla y en Excel, las ventas mensuales de 2025 y 2026
+(hojas: ventas con IVA, ventas netas y tickets) y las **ventas por producto y por sucursal** de cada
+año (hojas «Productos 2025», «Productos 2026» y «Detalle productos»).
 
 - No toca el dashboard ni sus variables: es otro repositorio y otro servicio de Railway.
-- Solo **lee** de FUDO (`/sales`); no escribe nada.
+- Solo **lee** de FUDO (`/sales` con sus ítems y `/products`); no escribe nada.
 - Criterio igual al del dashboard: ventas no canceladas, total de FUDO (con IVA), mes según la fecha de
   cierre en hora de Chile. Netas = total ÷ 1,19.
+- Por producto: **cantidad y precio de los ítems no anulados** de esas mismas ventas. Los productos se
+  juntan entre sucursales por nombre (sin distinguir mayúsculas ni espacios de más).
 
 ## Archivos
 
@@ -46,12 +49,23 @@ de FUDO de cada sucursal y entrega las ventas mensuales de 2025 y 2026 en pantal
 | `DASHBOARD_PASSWORD` | sí | Clave de ingreso. Si falta, la página queda cerrada (no hay clave por defecto) |
 | `SUCn_COLOR` | no | Color de la sucursal, p. ej. `#D85A30` |
 | `ANIOS` | no | Años a leer; por defecto `2025,2026` (p. ej. `ANIOS=2026`) |
+| `PRODUCTOS_SUBITEMS` | no | `excluir` deja fuera los subítems (modificadores o componentes de combos) de las ventas por producto; por defecto se cuentan como cualquier otro ítem |
+| `PRODUCTOS_PRECIO` | no | `linea` toma el precio de cada ítem como el total de su línea; por defecto es el precio unitario y las ventas son precio × cantidad. Solo hace falta si el cuadre sale muy por encima de 100 % |
 | `SECRET_KEY` | no | Firma de la sesión; si falta se deriva de la clave |
 | `PORT` | no | Lo define Railway |
 
 ## Cómo funciona
 
 - Cada sucursal se lee en paralelo, con una sola autenticación por lectura.
+- **Ventas por producto** (casilla *Incluir ventas por producto*, marcada por defecto): se leen también
+  los ítems de cada venta, por eso tarda bastante más. Si solo necesitas las ventas mensuales, desmárcala.
+  La página muestra los 30 productos con más ventas de cada año; el Excel trae la lista completa por
+  sucursal, el total y su % del año, y el detalle mes a mes (una fila por mes, sucursal y producto) para
+  armar tablas dinámicas.
+- **Cuadre**: en la hoja de cada año y en la **Cobertura** de cada sucursal aparece «ítems $X vs ventas $Y
+  (Z %)»: la suma de precio × cantidad de los ítems comparada con el total de las ventas del mismo
+  período. Debería quedar cerca de 100 %; la diferencia normal viene de descuentos o redondeos que FUDO
+  aplica a nivel de venta. Si difiere más de 10 %, la Cobertura lo avisa.
 - Por defecto se salta el historial anterior al primer año (búsqueda binaria de páginas). Si la sección
   **Cobertura** avisa que falta información, marca **Leer todo el historial** y genera de nuevo.
 - Puedes cerrar la página durante la lectura: sigue en segundo plano y el resultado queda disponible
@@ -68,6 +82,9 @@ de FUDO de cada sucursal y entrega las ventas mensuales de 2025 y 2026 en pantal
 | «FUDO rechazó las credenciales» | Revisa `SUCn_APIKEY` y `SUCn_APISECRET` de esa sucursal |
 | «FUDO limitó las autenticaciones (429)» | Espera unos minutos y vuelve a generar |
 | «la última venta leída es de hace N días» | Marca *Leer todo el historial* y genera de nuevo |
+| «FUDO no entregó las ventas con sus ítems…» | Genera de nuevo; si se repite, desmarca *Incluir ventas por producto* (las ventas mensuales salen igual) |
+| «los ítems difieren más de un 10 % del total de las ventas» | Mira el cuadre de cada sucursal. Si es **mayor a 100 %**, prueba primero `PRODUCTOS_SUBITEMS=excluir` en Variables (puede que los subítems se estén contando dos veces) y, si sigue alto, `PRODUCTOS_PRECIO=linea` (puede que FUDO ya entregue el precio multiplicado por la cantidad); cambia una a la vez y genera de nuevo. Si es **menor**, revisa si FUDO está entregando todos los ítems (aviso «ítems que FUDO nombra pero no entregó») |
+| «no se pudieron leer los nombres de los productos» | El reporte sale igual, con «Producto #id»; genera de nuevo para recuperar los nombres |
 | La página no abre | En Railway → *Deployments* → *View logs*; revisa que el último deploy diga *Success* |
 
 ## Probarlo en tu computador (opcional)
@@ -80,4 +97,5 @@ python app.py        # http://localhost:8080
 ```
 
 `ventas_mensuales.py` también funciona solo (usa un `config.py` con `SUCURSALES`):
-`python3 ventas_mensuales.py` o `python3 ventas_mensuales.py --completo`.
+`python3 ventas_mensuales.py`, `python3 ventas_mensuales.py --completo` (lee todo el historial) o
+`python3 ventas_mensuales.py --sin-productos` (solo ventas mensuales, mucho más rápido).

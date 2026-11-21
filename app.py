@@ -6,7 +6,7 @@ Página privada (protegida con clave) con un botón «Generar»: lee las ventas 
 cada sucursal desde la API de FUDO, muestra las tablas y entrega el Excel.
 
 Es un servicio APARTE del dashboard: no lo modifica, no comparte memoria con él
-y no escribe nada en FUDO (solo lee /sales).
+y no escribe nada en FUDO (solo lee /sales, /products y los ítems de cada venta).
 
 Variables de entorno (en Railway → Variables):
     SUC1_NOMBRE, SUC1_APIKEY, SUC1_APISECRET     sucursal 1 (igual que el dashboard)
@@ -14,7 +14,11 @@ Variables de entorno (en Railway → Variables):
     SUCn_COLOR                                     opcional, p. ej. #D85A30
     DASHBOARD_PASSWORD                             clave de acceso (obligatoria)
     ANIOS                                          opcional, por defecto 2025,2026
-    SECRET_KEY                                     opcional (si falta se deriva de la clave)
+    PRODUCTOS_SUBITEMS                             opcional: "excluir" no cuenta subítems
+                                                   (modificadores/componentes de combos)
+    PRODUCTOS_PRECIO                               opcional: "linea" toma el precio del ítem
+                                                   como total de la línea (no unitario)
+    SECRET_KEY                                    opcional (si falta se deriva de la clave)
     PORT                                           lo define Railway
 """
 
@@ -99,8 +103,8 @@ SUCURSALES = leer_sucursales()
 # ── Estado de la lectura (en memoria, un solo proceso) ───────
 
 LOCK = threading.Lock()
-JOB = {"id": 0, "fase": "libre", "completo": False, "inicio": 0.0, "fin": 0.0,
-       "mensaje": "", "sucs": []}                  # fase: libre | leyendo | listo | error
+JOB = {"id": 0, "fase": "libre", "completo": False, "productos": True, "inicio": 0.0,
+       "fin": 0.0, "mensaje": "", "sucs": []}      # fase: libre | leyendo | listo | error
 ULTIMO = {"resultado": None}                       # último resultado bueno
 
 
@@ -133,6 +137,8 @@ def texto_suc(s, completo=False):
     if e == "buscando":
         return ("Contando las páginas de ventas…" if completo
                 else f"Buscando dónde empiezan las ventas de {vm.ANIOS[0]}…")
+    if e == "productos":
+        return "Leyendo el catálogo de productos…"
     if e == "leyendo":
         return f"Página {s['pagina']} de {s['total']} · {vm.num(s['leidas'])} ventas leídas"
     if e == "listo":
@@ -145,7 +151,7 @@ def pct_suc(s):
     e = s["etapa"]
     if e == "pendiente":
         return 0
-    if e in ("autenticando", "buscando"):
+    if e in ("autenticando", "buscando", "productos"):
         return None
     if e == "leyendo":
         return min(99.0, round(100.0 * s["hechas"] / max(1, s["total"] - s["desde"] + 1), 1))
@@ -157,7 +163,8 @@ def instantanea():
         j = {k: v for k, v in JOB.items() if k != "sucs"}
         sucs = [dict(s) for s in JOB["sucs"]]
     fin = j["fin"] or time.time()
-    return {"fase": j["fase"], "completo": j["completo"], "mensaje": j["mensaje"],
+    return {"fase": j["fase"], "completo": j["completo"], "productos": j["productos"],
+            "mensaje": j["mensaje"],
             "transcurrido": int(fin - j["inicio"]) if j["inicio"] else 0,
             "sucs": [{"nombre": s["nombre"], "etapa": s["etapa"], "pct": pct_suc(s),
                       "texto": texto_suc(s, j["completo"]), "error": s["error"]} for s in sucs]}
@@ -170,7 +177,7 @@ def terminar_con_error(token, mensaje):
     log(f"lectura fallida: {mensaje}")
 
 
-def leer_una(token, i, suc, completo):
+def leer_una(token, i, suc, completo, productos):
     """Lee una sucursal (en su propio hilo y con su propia sesión HTTP)."""
     nombre = suc["nombre"]
 
@@ -194,7 +201,7 @@ def leer_una(token, i, suc, completo):
             cli = vm.Fudo(FUDO_AUTH, FUDO_BASE, suc, http=http)
             progreso({"etapa": "autenticando"})
             cli.autenticar()
-            r = vm.leer_sucursal(cli, nombre, completo, progreso=progreso)
+            r = vm.leer_sucursal(cli, nombre, completo, progreso=progreso, productos=productos)
         with LOCK:
             if JOB["id"] == token:
                 JOB["sucs"][i].update(etapa="listo", leidas=r["leidas"],
@@ -211,13 +218,14 @@ def leer_una(token, i, suc, completo):
         return nombre, None
 
 
-def ejecutar(token, completo):
+def ejecutar(token, completo, productos):
     t0 = time.time()
     log(f"lectura iniciada ({'completa' if completo else 'rápida'}, "
+        f"{'con' if productos else 'sin'} productos, "
         f"{len(SUCURSALES)} sucursales, {vm.texto_anios()})")
     try:
         with ThreadPoolExecutor(max_workers=max(1, len(SUCURSALES))) as pool:
-            futuros = [pool.submit(leer_una, token, i, s, completo)
+            futuros = [pool.submit(leer_una, token, i, s, completo, productos)
                        for i, s in enumerate(SUCURSALES)]
             resultados = [f.result() for f in futuros]
         nombres = [s["nombre"] for s in SUCURSALES]
@@ -230,7 +238,7 @@ def ejecutar(token, completo):
             return
         meses = vm.lista_meses()
         buf = io.BytesIO()
-        vm.escribir_xlsx(buf, vm.construir_hojas(nombres, datos, meses))
+        vm.escribir_xlsx(buf, vm.hojas_del_reporte(nombres, datos, meses))
         ahora = vm.ahora()
         resultado = {
             "xlsx": buf.getvalue(),
@@ -239,9 +247,7 @@ def ejecutar(token, completo):
             "duracion": time.time() - t0,
             "anios": vm.texto_anios(),
             "errores": errores,
-            "tablas": [tabla_html(nombres, datos, meses, 0, 1.0, vm.clp),
-                       tabla_html(nombres, datos, meses, 0, 1 / vm.IVA, vm.clp),
-                       tabla_html(nombres, datos, meses, 1, 1.0, vm.num)],
+            "pestanas": pestanas_html(nombres, datos, meses, productos),
             "cobertura": cobertura_html(nombres, datos, errores),
         }
         with LOCK:
@@ -254,16 +260,16 @@ def ejecutar(token, completo):
         terminar_con_error(token, limpiar(f"{type(e).__name__}: {e}"))
 
 
-def iniciar(completo):
+def iniciar(completo, productos=True):
     """Arranca una lectura; devuelve False si ya hay una en curso."""
     with LOCK:
         if JOB["fase"] == "leyendo" and time.time() - JOB["inicio"] < 2 * 3600:
             return False
         JOB["id"] += 1
         token = JOB["id"]
-        JOB.update(fase="leyendo", completo=completo, inicio=time.time(), fin=0.0,
-                   mensaje="", sucs=[nueva_suc(s) for s in SUCURSALES])
-    threading.Thread(target=ejecutar, args=(token, completo), daemon=True).start()
+        JOB.update(fase="leyendo", completo=completo, productos=productos, inicio=time.time(),
+                   fin=0.0, mensaje="", sucs=[nueva_suc(s) for s in SUCURSALES])
+    threading.Thread(target=ejecutar, args=(token, completo, productos), daemon=True).start()
     return True
 
 
@@ -291,6 +297,63 @@ def tabla_html(nombres, datos, meses, idx, factor, fmt):
         out.append("</tr>")
     out.append("</tbody></table>")
     return "".join(out)
+
+
+TOP_WEB = 30                                   # productos que se muestran por año (el Excel trae todos)
+
+
+def tabla_productos_html(nombres, datos, anio, top=TOP_WEB):
+    """(tabla, nota) de los productos más vendidos de un año, por sucursal."""
+    d = vm.filas_productos(nombres, datos, anio)
+    out = ['<table class="prod"><thead><tr><th class="mes" rowspan="2">Producto</th>']
+    for i, n in enumerate(nombres):
+        out.append(f'<th class="s{i}" colspan="2"><span class="dot"></span>{escape(n)}</th>')
+    out.append('<th colspan="2">Total</th><th rowspan="2">% ventas</th></tr><tr class="sub">')
+    out.append("<th>Unid.</th><th>Ventas</th>" * (len(nombres) + 1))
+    out.append("</tr></thead><tbody>")
+
+    def fila(etiqueta, por_suc, u, v, parte, total):
+        celdas = ['<tr class="total">' if total else "<tr>",
+                  f'<th scope="row" class="mes">{escape(etiqueta)}</th>']
+        for par in por_suc:
+            celdas.append(celda_html(None if par is None else par[0], vm.fmt_unid))
+            celdas.append(celda_html(None if par is None else par[1], vm.clp))
+        celdas.append(celda_html(u, vm.fmt_unid, total=True))
+        celdas.append(celda_html(v, vm.clp, total=True))
+        celdas.append('<td class="num mal">n/d</td>' if parte is None
+                      else f'<td class="num">{vm.pct(parte)}</td>')
+        celdas.append("</tr>")
+        return "".join(celdas)
+
+    tot_suc, tot_u, tot_v, _ = d["total"]
+    out.append(fila(f"TOTAL {anio} · {len(d['filas'])} productos", tot_suc, tot_u, tot_v,
+                    None if tot_v is None else (1.0 if tot_v else 0.0), True))
+    for nombre, por_suc, u, v, _, parte in d["filas"][:top]:
+        out.append(fila(nombre, por_suc, u, v, parte, False))
+    out.append("</tbody></table>")
+    partes = []
+    if len(d["filas"]) > top:
+        partes.append(f"Se muestran los {top} productos con más ventas de {anio} (hay "
+                      f"{vm.num(len(d['filas']))}); el Excel trae la lista completa y el detalle mes a mes.")
+    else:
+        partes.append(f"Hay {vm.num(len(d['filas']))} productos con ventas en {anio}; el Excel trae "
+                      "además el detalle mes a mes y las ventas netas.")
+    c = vm.cuadre_total(nombres, datos, anio)
+    if c:
+        partes.append(f"Cuadre con las ventas {anio}: {vm.texto_cuadre(c)}.")
+    return "".join(out), f'<p class="nota mute">{escape(" ".join(partes))}</p>'
+
+
+def pestanas_html(nombres, datos, meses, productos):
+    """[{titulo, tabla, nota}] en el orden en que se muestran las pestañas."""
+    p = [{"titulo": "Ventas con IVA", "tabla": tabla_html(nombres, datos, meses, 0, 1.0, vm.clp)},
+         {"titulo": "Ventas netas", "tabla": tabla_html(nombres, datos, meses, 0, 1 / vm.IVA, vm.clp)},
+         {"titulo": "Tickets", "tabla": tabla_html(nombres, datos, meses, 1, 1.0, vm.num)}]
+    if productos:
+        for anio in vm.anios_con_datos():
+            tabla, nota = tabla_productos_html(nombres, datos, anio)
+            p.append({"titulo": f"Productos {anio}", "tabla": tabla, "nota": nota})
+    return p
 
 
 def cobertura_html(nombres, datos, errores):
@@ -461,8 +524,11 @@ def generar():
     if not SUCURSALES:
         return jsonify(error="No hay sucursales configuradas (variables SUC1_NOMBRE, "
                              "SUC1_APIKEY y SUC1_APISECRET)"), 400
-    completo = bool((request.get_json(silent=True) or {}).get("completo"))
-    return jsonify(ok=True, nueva=iniciar(completo))
+    cuerpo = request.get_json(silent=True)
+    cuerpo = cuerpo if isinstance(cuerpo, dict) else {}
+    completo = bool(cuerpo.get("completo"))
+    productos = bool(cuerpo.get("productos", True))
+    return jsonify(ok=True, nueva=iniciar(completo, productos))
 
 
 @app.get("/descargar.xlsx")
@@ -495,7 +561,7 @@ CSS = """
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 -apple-system,BlinkMacSystemFont,
 "Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-.wrap{max-width:980px;margin:0 auto;padding:0 16px}
+.wrap{max-width:1100px;margin:0 auto;padding:0 16px}
 .top{border-bottom:1px solid var(--line);background:var(--card)}
 .top .wrap{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-top:14px;padding-bottom:14px}
 h1{font-size:18px;margin:0;font-weight:650}
@@ -541,6 +607,10 @@ thead th .dot{box-shadow:0 0 0 1.5px #fff}
 tbody tr+tr th,tbody tr+tr td{border-top:1px solid var(--line)}
 th.mes{text-align:left;position:sticky;left:0;background:var(--card);font-weight:500}
 thead th.mes{background:var(--head);font-weight:600}
+thead th[colspan]{text-align:center}
+thead tr.sub th{font-weight:500;font-size:12px;border-top:1px solid rgba(255,255,255,.25)}
+table.prod th,table.prod td{padding:7px 9px}
+table.prod th.mes{white-space:normal;min-width:140px;max-width:230px;box-shadow:1px 0 0 var(--line)}
 td.num{text-align:right}
 td.cero{color:var(--mute)}
 td.mal{color:var(--bad);font-weight:600}
@@ -563,7 +633,8 @@ details.cob summary{cursor:pointer;font-weight:600}
 background:var(--bg);color:var(--ink);font:inherit}
 .caja .btn{width:100%;margin-top:14px;text-align:center;padding:12px}
 .caja .msg{margin:14px 0 0}
-@media (max-width:560px){th,td{padding:7px 9px}.top .wrap{align-items:flex-start}}
+@media (max-width:560px){th,td{padding:7px 9px}.top .wrap{align-items:flex-start}
+table.prod th.mes{min-width:104px;max-width:136px;font-size:12.5px}}
 @media (prefers-reduced-motion:reduce){.barra{transition:none}.suc.indet .barra{animation:none;width:40%}}
 """
 
@@ -574,6 +645,7 @@ JS = """
   var csrf = cuerpo.getAttribute("data-csrf") || "";
   var boton = document.getElementById("generar");
   var completo = document.getElementById("completo");
+  var productos = document.getElementById("productos");
   var panel = document.getElementById("progreso");
   var reloj = document.getElementById("reloj");
   var msg = document.getElementById("msg");
@@ -635,7 +707,8 @@ JS = """
     fetch("/generar", {
       method: "POST", credentials: "same-origin",
       headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
-      body: JSON.stringify({ completo: !!(completo && completo.checked) })
+      body: JSON.stringify({ completo: !!(completo && completo.checked),
+                             productos: !!(productos && productos.checked) })
     })
       .then(function (r) {
         if (r.status === 401) { ya = true; location.href = "/login"; return null; }
@@ -724,11 +797,12 @@ def bloque_resultado(res):
                  "vuelve a generar el reporte para completarla.</p>")
     pestanas = "".join(
         f'<button type="button" role="tab" data-tab="{i}" aria-selected="{"true" if i == 0 else "false"}"'
-        f'{" class=on" if i == 0 else ""}>{escape(t)}</button>'
-        for i, t in enumerate(["Ventas con IVA", "Ventas netas", "Tickets"]))
+        f'{" class=on" if i == 0 else ""}>{escape(p["titulo"])}</button>'
+        for i, p in enumerate(res["pestanas"]))
     paneles = "".join(
-        f'<div data-panel="{i}"{"" if i == 0 else " hidden"}><div class="scroll">{t}</div></div>'
-        for i, t in enumerate(res["tablas"]))
+        f'<div data-panel="{i}"{"" if i == 0 else " hidden"}><div class="scroll">{p["tabla"]}</div>'
+        f'{p.get("nota", "")}</div>'
+        for i, p in enumerate(res["pestanas"]))
     return (
         '<section class="card" id="resultados" data-oculta-al-leer>'
         '<div class="cab"><div><h2>Resultado · ' + escape(res["anios"]) + '</h2>'
@@ -755,10 +829,13 @@ def pagina_principal(snap, res):
     control = (
         '<section class="card"><div class="fila">'
         f'<button id="generar" class="btn" type="button"{deshabilitar}>{etiqueta}</button>'
+        '<label class="chk"><input type="checkbox" id="productos" checked> '
+        "Incluir ventas por producto (más lento)</label>"
         '<label class="chk"><input type="checkbox" id="completo"> '
         "Leer todo el historial (más lento)</label></div>"
         '<p class="ayuda">Lee las ventas de cada sucursal directamente desde FUDO. Tarda varios '
-        "minutos; puedes cerrar la página y volver más tarde: la lectura sigue en segundo plano "
+        "minutos, y bastante más si incluye productos porque lee los ítems de cada venta; puedes "
+        "cerrar la página y volver más tarde: la lectura sigue en segundo plano "
         "y el resultado queda aquí mientras el servicio siga activo. Por defecto se salta el "
         "historial anterior a " + str(vm.ANIOS[0]) + "; marca la opción solo si la cobertura avisa "
         'que falta información.</p><p class="msg" id="msg" role="alert" hidden></p>'
